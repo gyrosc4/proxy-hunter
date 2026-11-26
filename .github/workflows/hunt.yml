@@ -1,0 +1,94 @@
+name: Proxy Hunter
+
+on:
+  workflow_dispatch:
+    inputs:
+      protocol:
+        description: "Which protocol do you want?"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - vless
+          - vmess
+          - trojan
+          - ss
+          - hysteria2
+  schedule:
+    - cron: "0 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: proxy-hunter
+  cancel-in-progress: false
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    steps:
+      - name: Get repo files
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install sing-box test engine
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p /tmp/sb
+          gh release download --repo SagerNet/sing-box \
+            --pattern '*-linux-amd64.tar.gz' --dir /tmp/sb --clobber
+          FILE=$(ls /tmp/sb/*-linux-amd64.tar.gz | head -n 1)
+          tar -xzf "$FILE" -C /tmp/sb
+          BIN=$(find /tmp/sb -type f -name sing-box | head -n 1)
+          sudo install -m 755 "$BIN" /usr/local/bin/sing-box
+          sing-box version
+
+      - name: Hunt for the fastest configs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROTOCOL: ${{ github.event.inputs.protocol || 'all' }}
+        run: |
+          python nodehunt.py \
+            --protocol "$PROTOCOL" \
+            --top 10 \
+            --out-dir out \
+            --batch 150 \
+            --concurrency 32 \
+            --timeout 4000 \
+            --rounds 2 \
+            --rounds-final 3 \
+            --max-test 900 \
+            --discover 15
+
+      - name: Save results into the repo
+        if: always()
+        run: |
+          git config user.name  "proxy-hunter-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -f out
+          git commit -m "Update configs $(date -u '+%Y-%m-%d %H:%M UTC')" || echo "No changes"
+          git push || echo "Push skipped - download the artifact instead"
+
+      - name: Upload results as a download
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: configs
+          path: out/
+          if-no-files-found: warn
+          retention-days: 30
