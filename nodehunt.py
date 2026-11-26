@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 nodehunt - harvest public GitHub proxy pools, keep only LIVE nodes,
-measure REAL end-to-end latency with sing-box, export the N fastest.
+measure REAL latency + REAL bandwidth with sing-box, export the best.
 
-RULE: VLESS and Trojan are kept ONLY when transport = ws or httpupgrade.
-      VMess / Shadowsocks / Hysteria2 = any transport, alive + fast is enough.
-
-Designed to never crash: every risky step is wrapped and skipped on failure.
+RULES
+  * VLESS / Trojan  -> transport must be ws or httpupgrade
+  * ANY ws/httpupgrade config -> must have a real, non-empty Host header
+  * VMess / SS / Hysteria2 -> any transport
+  * Output: 50 ws + 50 httpupgrade (auto-backfill if one type is short)
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ import os
 import platform
 import re
 import shutil
+import socket
 import statistics
 import subprocess
 import sys
@@ -28,6 +30,7 @@ import tempfile
 import time
 import traceback
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, quote
 
@@ -37,18 +40,29 @@ except ImportError:
     print("Missing package. Run: pip install -r requirements.txt")
     sys.exit(0)
 
-# ------------------------------------------------------------------ constants
+try:
+    import h2  # noqa: F401
+    HTTP2 = True
+except Exception:
+    HTTP2 = False
+
 UA = {"User-Agent": "nodehunt/1.0"}
 SCHEMES = {"vless": "vless", "vmess": "vmess", "trojan": "trojan",
            "ss": "ss", "hysteria2": "hysteria2", "hy2": "hysteria2"}
 PROTOS = ["vless", "vmess", "trojan", "ss", "hysteria2"]
-VT_ONLY = {"ws", "httpupgrade"}          # the vless / trojan restriction
+VT_ONLY = {"ws", "httpupgrade"}
+SPLIT_PROTOS = {"vless", "trojan"}
+
+SPEED_URL = "https://speed.cloudflare.com/__down?bytes=262144"
+SPEED_BYTES = 262144
+MAXFILE = 5_000_000
 
 LINK_RE = re.compile(r"(?:vless|vmess|trojan|ss|hysteria2|hy2)://[^\s\"'<>`\\]+", re.I)
 B64_RE = re.compile(r"[A-Za-z0-9+/=_-]{120,}")
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?"
                      r"[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}$")
 HEX_RE = re.compile(r"^[0-9a-fA-F]*$")
+HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$")
 
 NET_MAP = {"tcp": "tcp", "raw": "tcp", "ws": "ws", "websocket": "ws",
            "httpupgrade": "httpupgrade", "http-upgrade": "httpupgrade",
@@ -70,10 +84,13 @@ TEST_URLS = ["https://www.gstatic.com/generate_204",
 TREE_SKIP = re.compile(r"(^|/)(\.github|docs?|img|images|assets|node_modules)/", re.I)
 TREE_KEY = re.compile(r"(\.txt$|/sub|^sub|base64|list|node|prox|config|subscribe|"
                       r"protocols/|Splitted-By-Protocol|Eternity|v2ray|^README\.md$)", re.I)
+
 PORTS = itertools.count(19100)
+IN_BASE = itertools.count(31000, 100)
+API_OK = False
+TIERS = ("GOLD", "SILVER", "BRONZE")
 
 
-# ------------------------------------------------------------------ helpers
 def log(*a):
     print(*a, flush=True)
 
@@ -132,10 +149,9 @@ def gh_headers():
     return h
 
 
-# ------------------------------------------------------------------ 1. harvest
+# ------------------------------------------------------------------ harvest
 def load_sources(path="sources.txt"):
-    repos = {}
-    urls = []
+    repos, urls = {}, []
     p = Path(path)
     if not p.exists():
         return repos, urls
@@ -143,10 +159,9 @@ def load_sources(path="sources.txt"):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        if line.startswith("http://") or line.startswith("https://"):
+        if line.startswith(("http://", "https://")):
             urls.append(line)
-            continue
-        if ":" in line and "/" in line:
+        elif ":" in line and "/" in line:
             repo, _, fpath = line.partition(":")
             repos.setdefault(repo.strip(), []).append(fpath.strip())
         elif "/" in line:
@@ -155,29 +170,41 @@ def load_sources(path="sources.txt"):
 
 
 async def fetch_repo(client, repo, paths):
-    """Try listed paths; if the repo gives nothing, scan its file tree."""
-    texts = []
-    branch = None
-    for p in paths:
-        tries = [branch] if branch else ["main", "master", "HEAD"]
-        for br in tries:
+    texts, branch = [], None
+
+    def url(p, br):
+        return "https://raw.githubusercontent.com/%s/%s/%s" % (repo, br, p)
+
+    async def grab(p, br):
+        try:
+            r = await client.get(url(p, br))
+            if r.status_code == 200 and r.text.strip() and len(r.text) < MAXFILE:
+                return r.text
+        except Exception:
+            pass
+        return None
+
+    if paths:
+        for br in ("main", "master", "HEAD"):
             try:
-                r = await client.get(
-                    f"https://raw.githubusercontent.com/{repo}/{br}/{p}")
-                if r.status_code == 200 and r.text.strip():
+                r = await client.get(url(paths[0], br))
+                if r.status_code == 200:
                     branch = br
-                    if len(r.text) < 12_000_000:
+                    if r.text.strip() and len(r.text) < MAXFILE:
                         texts.append(r.text)
                     break
             except Exception:
                 pass
+        if branch and len(paths) > 1:
+            got = await asyncio.gather(*(grab(p, branch) for p in paths[1:]))
+            texts += [g for g in got if g]
     if texts:
         return texts
 
     for ref in ("HEAD", "main", "master"):
         try:
             r = await client.get(
-                f"https://api.github.com/repos/{repo}/git/trees/{ref}?recursive=1",
+                "https://api.github.com/repos/%s/git/trees/%s?recursive=1" % (repo, ref),
                 headers=gh_headers(), timeout=25)
             if r.status_code != 200:
                 continue
@@ -185,9 +212,8 @@ async def fetch_repo(client, repo, paths):
             for e in r.json().get("tree", []):
                 if e.get("type") != "blob":
                     continue
-                size = e.get("size", 0)
-                path = e.get("path", "")
-                if not (20 < size < 8_000_000) or TREE_SKIP.search(path):
+                path, size = e.get("path", ""), e.get("size", 0)
+                if not (20 < size < MAXFILE) or TREE_SKIP.search(path):
                     continue
                 name = path.rsplit("/", 1)[-1]
                 ext = Path(name).suffix.lower()
@@ -197,17 +223,16 @@ async def fetch_repo(client, repo, paths):
                     continue
                 if TREE_KEY.search(path):
                     cand.append(path)
-            for path in cand[:15]:
-                for br in ([branch] if branch else ["main", "master", "HEAD"]):
-                    try:
-                        rr = await client.get(
-                            f"https://raw.githubusercontent.com/{repo}/{br}/{path}")
-                        if rr.status_code == 200 and rr.text.strip():
-                            branch = br
-                            texts.append(rr.text)
-                            break
-                    except Exception:
-                        pass
+            if cand:
+                for br in ("main", "master", "HEAD"):
+                    t = await grab(cand[0], br)
+                    if t is not None:
+                        branch = br
+                        texts.append(t)
+                        break
+                if branch:
+                    got = await asyncio.gather(*(grab(p, branch) for p in cand[1:12]))
+                    texts += [g for g in got if g]
             break
         except Exception:
             continue
@@ -215,30 +240,35 @@ async def fetch_repo(client, repo, paths):
 
 
 async def discover(client, limit):
-    found = {}
-    for q in ("v2ray+configs", "v2ray+subscription", "free+v2ray+nodes",
-              "proxy+collector+vless", "hysteria2+subscription"):
+    qs = ("v2ray+configs", "v2ray+subscription", "free+v2ray+nodes",
+          "proxy+collector+vless", "hysteria2+subscription")
+
+    async def one(q):
         try:
             r = await client.get(
-                f"https://api.github.com/search/repositories?q={q}"
-                f"&sort=stars&order=desc&per_page=15",
+                "https://api.github.com/search/repositories?q=%s"
+                "&sort=stars&order=desc&per_page=15" % q,
                 headers=gh_headers(), timeout=25)
-            if r.status_code != 200:
-                continue
-            for it in r.json().get("items", []):
-                if it.get("archived") or it.get("size", 0) > 400_000:
-                    continue
-                found[it["full_name"]] = it.get("stargazers_count", 0)
+            if r.status_code == 200:
+                return r.json().get("items", [])
         except Exception:
-            continue
+            pass
+        return []
+
+    found = {}
+    for items in await asyncio.gather(*(one(q) for q in qs)):
+        for it in items:
+            if it.get("archived") or it.get("size", 0) > 300_000:
+                continue
+            found[it["full_name"]] = it.get("stargazers_count", 0)
     return [k for k, _ in sorted(found.items(), key=lambda x: -x[1])][:limit]
 
 
 async def harvest(args):
     repos, urls = load_sources()
     texts = []
-    limits = httpx.Limits(max_connections=24, max_keepalive_connections=12)
-    async with httpx.AsyncClient(headers=UA, timeout=30,
+    limits = httpx.Limits(max_connections=64, max_keepalive_connections=32)
+    async with httpx.AsyncClient(headers=UA, timeout=25, http2=HTTP2,
                                  follow_redirects=True, limits=limits) as c:
         if args.discover:
             try:
@@ -246,8 +276,8 @@ async def harvest(args):
                     repos.setdefault(r, [])
             except Exception:
                 pass
-        log(f"[sources] {len(repos)} repos, {len(urls)} extra URLs")
-        sem = asyncio.Semaphore(6)
+        log("[sources] %d repos, %d extra URLs (http2=%s)" % (len(repos), len(urls), HTTP2))
+        sem = asyncio.Semaphore(14)
 
         async def one(repo, paths):
             async with sem:
@@ -256,16 +286,19 @@ async def harvest(args):
                 except Exception:
                     got = []
                 texts.extend(got)
-                log(f"[sources] {repo:<50} {sum(len(x) for x in got)/1024:8.1f} KiB")
+                log("[sources] %-48s %8.1f KiB" % (repo, sum(len(x) for x in got) / 1024))
 
         await asyncio.gather(*(one(r, p) for r, p in list(repos.items())[:40]))
-        for u in urls[:20]:
-            try:
-                r = await c.get(u)
-                if r.status_code == 200:
-                    texts.append(r.text)
-            except Exception:
-                pass
+        if urls:
+            async def geturl(u):
+                try:
+                    r = await c.get(u)
+                    if r.status_code == 200 and len(r.text) < MAXFILE:
+                        return r.text
+                except Exception:
+                    pass
+                return None
+            texts += [t for t in await asyncio.gather(*(geturl(u) for u in urls[:20])) if t]
     return texts
 
 
@@ -278,7 +311,7 @@ def extract_links(text: str):
 
     try:
         scan(text)
-        if not out or B64_RE.search(text):
+        if len(out) < 50:
             if is_b64ish(text):
                 try:
                     d = b64d(text)
@@ -287,7 +320,7 @@ def extract_links(text: str):
                 except Exception:
                     pass
             for i, m in enumerate(B64_RE.finditer(text)):
-                if i > 500:
+                if i > 400:
                     break
                 try:
                     d = b64d(m.group(0))
@@ -310,7 +343,7 @@ def extract_links(text: str):
     return out
 
 
-# ------------------------------------------------------------------ 2. parse
+# ------------------------------------------------------------------ parse
 def norm_net(v):
     return NET_MAP.get(str(v).strip().lower(), str(v).strip().lower())
 
@@ -440,7 +473,6 @@ def finish(n):
             return None
     if n["proto"] == "hysteria2" and p.get("obfs") and p["obfs"] != "salamander":
         return None
-
     n["key"] = "|".join(str(x) for x in [
         n["proto"], n["host"].lower(), n["port"], n["secret"], n["net"],
         n["security"], p.get("path", ""), p.get("host", ""), p.get("sni", ""),
@@ -450,58 +482,132 @@ def finish(n):
     return n
 
 
+# ------------------------------------------------------------------ QUALITY GATES
+def effective_host(n):
+    """The Host header this config will actually send."""
+    h = (n["params"].get("host") or "").strip()
+    if not h and not is_ip(n["host"]):
+        h = n["host"].strip()
+    if h.count(":") == 1:
+        h = h.split(":")[0]
+    return h.strip().strip(".")
+
+
+def host_ok(n):
+    """NEW RULE: ws / httpupgrade must carry a real hostname in Host."""
+    if n["net"] not in ("ws", "httpupgrade"):
+        return True
+    h = effective_host(n)
+    if not h or " " in h or is_ip(h) or "." not in h:
+        return False
+    return HOST_RE.match(h) is not None
+
+
 def gate(n):
-    """THE RULE: vless + trojan must be ws or httpupgrade."""
-    if n["proto"] in ("vless", "trojan"):
+    """VLESS / Trojan must be ws or httpupgrade."""
+    if n["proto"] in SPLIT_PROTOS:
         return n["net"] in VT_ONLY
     return True
 
 
-# ------------------------------------------------------------------ 3. preflight
+def unique_servers(pool):
+    seen, out = set(), []
+    for n in pool:
+        k = (n["host"].lower(), n["port"], n["net"])
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(n)
+    return out
+
+
+def spread(pool, limit):
+    if limit <= 0 or len(pool) <= limit:
+        return pool
+    step = len(pool) / float(limit)
+    return [pool[int(i * step)] for i in range(limit)]
+
+
+def allocate_quota(items, budget, split):
+    """Guarantee both transports get tested so 50/50 can actually be filled."""
+    if budget <= 0 or len(items) <= budget:
+        return items
+    if not split:
+        return spread(items, budget)
+    ws = [n for n in items if n["net"] == "ws"]
+    hu = [n for n in items if n["net"] == "httpupgrade"]
+    half = budget // 2
+    na = min(len(ws), half)
+    nb = min(len(hu), budget - na)
+    na = min(len(ws), budget - nb)
+    return spread(ws, na) + spread(hu, nb)
+
+
+# ------------------------------------------------------------------ preflight
 async def preflight(nodes, timeout, conc):
-    sem = asyncio.Semaphore(conc)
+    """DNS cached per hostname, TCP cached per ip:port. Massive dedupe."""
     loop = asyncio.get_running_loop()
-    alive = []
+    sem = asyncio.Semaphore(conc)
+    ips = {n["host"]: n["host"] for n in nodes if is_ip(n["host"])}
+    names = sorted({n["host"] for n in nodes if not is_ip(n["host"])})
+    done = 0
 
-    async def resolve(h):
-        try:
-            infos = await asyncio.wait_for(
-                loop.getaddrinfo(h, None, type=socket.SOCK_STREAM), timeout)
-            v4 = [i for i in infos if i[0] == socket.AF_INET]
-            return (v4 or infos)[0][4][0]
-        except Exception:
-            return None
-
-    async def one(n):
+    async def res(h):
+        nonlocal done
         async with sem:
             try:
-                ip = n["host"] if is_ip(n["host"]) else await resolve(n["host"])
-                if not ip:
-                    return
-                if n["proto"] == "hysteria2":      # QUIC/UDP - no TCP probe
-                    n["ip"] = ip
-                    alive.append(n)
-                    return
-                _, w = await asyncio.wait_for(
-                    asyncio.open_connection(ip, n["port"]), timeout)
+                infos = await asyncio.wait_for(
+                    loop.getaddrinfo(h, None, type=socket.SOCK_STREAM), timeout)
+                v4 = [i for i in infos if i[0] == socket.AF_INET]
+                ips[h] = (v4 or infos)[0][4][0]
+            except Exception:
+                ips[h] = None
+            done += 1
+            if done % 500 == 0:
+                log("      dns %d/%d" % (done, len(names)))
+
+    if names:
+        await asyncio.gather(*(res(h) for h in names))
+    log("    dns: %d names -> %d resolved" % (len(names), sum(1 for v in ips.values() if v)))
+
+    pairs = sorted({(ips[n["host"]], n["port"]) for n in nodes
+                    if ips.get(n["host"]) and n["proto"] != "hysteria2"})
+    ok = set()
+    done = 0
+
+    async def tcp(ip, port):
+        nonlocal done
+        async with sem:
+            try:
+                _, w = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout)
                 w.close()
                 try:
                     await asyncio.wait_for(w.wait_closed(), 1)
                 except Exception:
                     pass
-                n["ip"] = ip
-                alive.append(n)
+                ok.add((ip, port))
             except Exception:
                 pass
+            done += 1
+            if done % 500 == 0:
+                log("      tcp %d/%d  open %d" % (done, len(pairs), len(ok)))
 
-    await asyncio.gather(*(one(n) for n in nodes))
+    if pairs:
+        await asyncio.gather(*(tcp(ip, p) for ip, p in pairs))
+    log("    tcp: %d endpoints -> %d open" % (len(pairs), len(ok)))
+
+    alive = []
+    for n in nodes:
+        ip = ips.get(n["host"])
+        if not ip:
+            continue
+        if n["proto"] == "hysteria2" or (ip, n["port"]) in ok:
+            n["ip"] = ip
+            alive.append(n)
     return alive
 
 
-import socket  # noqa: E402  (used above)
-
-
-# ------------------------------------------------------------------ 4. engine
+# ------------------------------------------------------------------ engine
 def ensure_singbox(bindir: Path) -> str:
     exe = shutil.which("sing-box")
     if exe:
@@ -513,9 +619,10 @@ def ensure_singbox(bindir: Path) -> str:
     arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64",
             "arm64": "arm64"}.get(platform.machine().lower())
     if not sysname or not arch:
-        raise RuntimeError("Cannot auto-install sing-box on this system")
+        raise RuntimeError("Cannot auto-install sing-box here")
     ext = "zip" if sysname == "windows" else "tar.gz"
-    pat = re.compile(r"sing-box-[\d.]+-" + sysname + "-" + arch + r"\." + ext.replace(".", r"\.") + "$")
+    pat = re.compile(r"sing-box-[\d.]+-" + sysname + "-" + arch + r"\." +
+                     ext.replace(".", r"\.") + "$")
     with httpx.Client(headers=gh_headers(), timeout=90, follow_redirects=True) as c:
         rel = c.get("https://api.github.com/repos/SagerNet/sing-box/releases/latest").json()
         asset = next(a for a in rel.get("assets", []) if pat.search(a["name"]))
@@ -541,10 +648,10 @@ def tls_block(n):
     p = n["params"]
     if n["security"] == "none" and n["proto"] != "hysteria2":
         return None
-    sni = p.get("sni") or (n["host"] if not is_ip(n["host"]) else "")
+    sni = p.get("sni") or effective_host(n)
     t = {"enabled": True,
          "insecure": truthy(p.get("allowInsecure") or p.get("insecure"))}
-    if sni:
+    if sni and not is_ip(sni):
         t["server_name"] = sni
     else:
         t["insecure"] = True
@@ -562,12 +669,10 @@ def tls_block(n):
 
 def transport_block(n):
     p, net = n["params"], n["net"]
-    hdr = p.get("host") or (n["host"] if not is_ip(n["host"]) else "")
+    hdr = effective_host(n)
     path = p.get("path") or "/"
     if net == "ws":
-        t = {"type": "ws", "path": path}
-        if hdr:
-            t["headers"] = {"Host": hdr}
+        t = {"type": "ws", "path": path, "headers": {"Host": hdr}}
         m = re.search(r"[?&]ed=(\d+)", path)
         if m:
             t["path"] = re.split(r"[?&]ed=", path)[0]
@@ -575,10 +680,7 @@ def transport_block(n):
             t["early_data_header_name"] = "Sec-WebSocket-Protocol"
         return t
     if net == "httpupgrade":
-        t = {"type": "httpupgrade", "path": path}
-        if hdr:
-            t["host"] = hdr
-        return t
+        return {"type": "httpupgrade", "path": path, "host": hdr}
     if net == "grpc":
         return {"type": "grpc", "service_name": p.get("serviceName") or p.get("path", "")}
     if net == "http":
@@ -629,9 +731,9 @@ def to_outbound(n, tag):
     return o
 
 
-def sb_config(nodes, tags, port):
+def sb_config(nodes, tags, port, use_urltest=False):
     outs = [to_outbound(n, t) for n, t in zip(nodes, tags)]
-    if len(outs) >= 2:
+    if use_urltest and len(outs) >= 2:
         outs.append({"type": "urltest", "tag": "auto", "outbounds": list(tags),
                      "url": TEST_URLS[0], "interval": "1h", "tolerance": 50})
     return {"log": {"level": "error", "timestamp": False},
@@ -639,38 +741,44 @@ def sb_config(nodes, tags, port):
             "experimental": {"clash_api": {"external_controller": "127.0.0.1:%d" % port}}}
 
 
-def check_ok(exe, cfg):
+def speed_config(nodes, tags, api_port, in_base):
+    outs = [to_outbound(n, t) for n, t in zip(nodes, tags)]
+    ins, rules = [], []
+    for i, t in enumerate(tags):
+        it = "in%05d" % i
+        ins.append({"type": "mixed", "tag": it, "listen": "127.0.0.1",
+                    "listen_port": in_base + i})
+        rules.append({"inbound": [it], "outbound": t})
+    return {"log": {"level": "error", "timestamp": False},
+            "inbounds": ins, "outbounds": outs,
+            "route": {"rules": rules, "final": tags[0]},
+            "experimental": {"clash_api": {"external_controller": "127.0.0.1:%d" % api_port}}}
+
+
+def check_one(exe, wd, n, tag, i):
+    cfg = wd / ("chk_%d.json" % i)
     try:
-        r = subprocess.run([exe, "check", "-c", str(cfg)],
-                           capture_output=True, timeout=90)
-        return r.returncode == 0
+        cfg.write_text(json.dumps(sb_config([n], [tag], 19099)))
+        r = subprocess.run([exe, "check", "-c", str(cfg)], capture_output=True, timeout=20)
+        ok = r.returncode == 0
     except Exception:
-        return False
-
-
-def prune(exe, wd, nodes, tags):
-    """Drop configs sing-box refuses, by bisecting - fast, no network."""
-    cfg = wd / "check.json"
-
-    def rec(idx):
-        if not idx:
-            return []
-        try:
-            cfg.write_text(json.dumps(
-                sb_config([nodes[i] for i in idx], [tags[i] for i in idx], next(PORTS))))
-        except Exception:
-            return []
-        if check_ok(exe, cfg):
-            return idx
-        if len(idx) == 1:
-            return []
-        m = len(idx) // 2
-        return rec(idx[:m]) + rec(idx[m:])
-
+        ok = False
     try:
-        return rec(list(range(len(nodes))))
+        cfg.unlink()
     except Exception:
-        return list(range(len(nodes)))
+        pass
+    return ok
+
+
+async def validate_parallel(exe, wd, nodes, tags):
+    loop = asyncio.get_running_loop()
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futs = [loop.run_in_executor(pool, check_one, exe, wd, n, tags[i], i)
+                for i, n in enumerate(nodes)]
+        oks = await asyncio.gather(*futs)
+    keep = [i for i, ok in enumerate(oks) if ok]
+    log("    config check: %d ok, %d dropped" % (len(keep), len(nodes) - len(keep)))
+    return keep
 
 
 class Engine:
@@ -679,16 +787,16 @@ class Engine:
         self.proc = None
         self.base = "http://127.0.0.1:%d" % port
 
-    async def start(self, nodes, tags, client):
-        cfg = self.wd / "sb.json"
-        cfg.write_text(json.dumps(sb_config(nodes, tags, self.port)))
+    async def start_cfg(self, cfg, client):
+        path = self.wd / "sb.json"
+        path.write_text(json.dumps(cfg))
         logf = open(self.wd / "sb.log", "ab")
         try:
-            self.proc = subprocess.Popen([self.exe, "run", "-c", str(cfg)],
+            self.proc = subprocess.Popen([self.exe, "run", "-c", str(path)],
                                          stdout=logf, stderr=logf)
         except Exception:
             return False
-        for _ in range(90):
+        for _ in range(60):
             if self.proc.poll() is not None:
                 return False
             try:
@@ -705,7 +813,7 @@ class Engine:
             if self.proc and self.proc.poll() is None:
                 self.proc.terminate()
                 try:
-                    self.proc.wait(6)
+                    self.proc.wait(5)
                 except Exception:
                     self.proc.kill()
         except Exception:
@@ -713,139 +821,272 @@ class Engine:
         self.proc = None
 
 
-async def run_group(exe, wd, nodes, tags, args, client):
+async def try_run(exe, wd, nodes, tags, client, o, use_urltest):
     eng = Engine(exe, wd, next(PORTS))
-    if not await eng.start(nodes, tags, client):
+    if not await eng.start_cfg(sb_config(nodes, tags, eng.port, use_urltest), client):
         eng.stop()
-        if len(nodes) == 1:
-            return {}
-        m = len(nodes) // 2
-        a = await run_group(exe, wd, nodes[:m], tags[:m], args, client)
-        b = await run_group(exe, wd, nodes[m:], tags[m:], args, client)
-        return {**a, **{k + m: v for k, v in b.items()}}
-
+        return None
     res = {i: [] for i in range(len(nodes))}
-    sem = asyncio.Semaphore(args.concurrency)
+    sem = asyncio.Semaphore(o["conc"])
+    total = len(nodes) * o["rounds"]
+    done = 0
 
     async def probe(i, url):
+        nonlocal done
         async with sem:
             try:
                 r = await client.get(eng.base + "/proxies/" + tags[i] + "/delay",
-                                     params={"url": url, "timeout": args.timeout},
-                                     timeout=args.timeout / 1000 + 5)
+                                     params={"url": url, "timeout": o["timeout"]},
+                                     timeout=o["timeout"] / 1000 + 5)
                 if r.status_code == 200:
                     d = r.json().get("delay", 0)
                     if isinstance(d, (int, float)) and d > 0:
                         res[i].append(float(d))
             except Exception:
                 pass
+            done += 1
+            if done % 40 == 0:
+                log("      %s %d/%d probes" % (o["label"], done, total))
 
     try:
-        await asyncio.sleep(1.5)
-        for rd in range(max(1, args.rounds)):
-            url = TEST_URLS[rd % len(TEST_URLS)]
+        for rd in range(o["rounds"]):
+            url = o["urls"][rd % len(o["urls"])]
             await asyncio.gather(*(probe(i, url) for i in range(len(nodes))))
-        missing = [i for i in range(len(nodes)) if not res[i]]
-        if missing:
-            try:
-                r = await client.get(eng.base + "/proxies", timeout=15)
-                if r.status_code == 200:
-                    px = r.json().get("proxies", {})
-                    for i in missing:
-                        h = px.get(tags[i], {}).get("history") or []
-                        if h:
-                            d = h[-1].get("delay")
-                            if isinstance(d, (int, float)) and d > 0:
-                                res[i].append(float(d))
-            except Exception:
-                pass
+            log("    %s round %d/%d done" % (o["label"], rd + 1, o["rounds"]))
+        if o["allow_history"]:
+            missing = [i for i in range(len(nodes)) if not res[i]]
+            if missing:
+                try:
+                    r = await client.get(eng.base + "/proxies", timeout=15)
+                    if r.status_code == 200:
+                        px = r.json().get("proxies", {})
+                        for i in missing:
+                            h = px.get(tags[i], {}).get("history") or []
+                            if h:
+                                d = h[-1].get("delay")
+                                if isinstance(d, (int, float)) and d > 0:
+                                    res[i].append(float(d))
+                except Exception:
+                    pass
     finally:
         eng.stop()
     return {i: v for i, v in res.items() if v}
 
 
-async def measure_batch(exe, wd, nodes, args, client):
+async def measure_batch(exe, wd, nodes, client, o):
+    global API_OK
     tags = ["n%05d" % i for i in range(len(nodes))]
-    keep = prune(exe, wd, nodes, tags)
-    if not keep:
-        return {}
-    sub = [nodes[i] for i in keep]
-    stags = [tags[i] for i in keep]
-    local = await run_group(exe, wd, sub, stags, args, client)
-    return {keep[i]: v for i, v in local.items()}
+    idx = list(range(len(nodes)))
+    cn, ct = nodes, tags
+    res = await try_run(exe, wd, cn, ct, client, o, False)
+    if res is None:
+        log("    batch had a bad config - validating individually")
+        keep = await validate_parallel(exe, wd, nodes, tags)
+        if not keep:
+            return {}
+        idx = keep
+        cn = [nodes[i] for i in keep]
+        ct = [tags[i] for i in keep]
+        res = await try_run(exe, wd, cn, ct, client, o, False)
+        if res is None:
+            return {}
+    if not res and not API_OK:
+        alt = await try_run(exe, wd, cn, ct, client, o, True)
+        if alt:
+            res = alt
+    if res:
+        API_OK = True
+    return {idx[i]: v for i, v in res.items()}
 
 
-async def measure_all(exe, nodes, args):
+async def measure_all(exe, nodes, args, urls=None, timeout=None, rounds=None,
+                      conc=None, label="test", allow_history=True):
     out = {}
+    if not nodes:
+        return out
+    o = {"urls": urls or TEST_URLS, "timeout": timeout or args.timeout,
+         "rounds": max(1, rounds or args.rounds), "conc": conc or args.concurrency,
+         "label": label, "allow_history": allow_history}
     work = Path(args.workdir)
     work.mkdir(parents=True, exist_ok=True)
     batches = [nodes[i:i + args.batch] for i in range(0, len(nodes), args.batch)]
-    async with httpx.AsyncClient(timeout=args.timeout / 1000 + 10) as client:
+    async with httpx.AsyncClient(timeout=o["timeout"] / 1000 + 10) as client:
         for bi, batch in enumerate(batches, 1):
+            if time.time() > args.deadline:
+                log("[%s] time budget reached - keeping what we have" % label)
+                break
             t0 = time.time()
+            log("[%s] batch %d/%d (%d nodes)" % (label, bi, len(batches), len(batch)))
             try:
                 with tempfile.TemporaryDirectory(dir=work) as td:
-                    res = await measure_batch(exe, Path(td), batch, args, client)
+                    res = await measure_batch(exe, Path(td), batch, client, o)
             except Exception:
                 res = {}
             for i, s in res.items():
                 out[batch[i]["uid"]] = s
-            log("[test] batch %d/%d  tested=%d  alive=%d  %.1fs"
-                % (bi, len(batches), len(batch), len(res), time.time() - t0))
+            log("[%s] batch %d/%d alive=%d %.1fs"
+                % (label, bi, len(batches), len(res), time.time() - t0))
     return out
 
 
-# ------------------------------------------------------------------ 5. export
-def export(proto, ranked, args):
+async def speed_measure(exe, nodes, args):
+    """Real 256 KB download through each proxy -> KB/s. This is the gold filter."""
+    out = {}
+    if not nodes:
+        return out
+    work = Path(args.workdir)
+    work.mkdir(parents=True, exist_ok=True)
+    batches = [nodes[i:i + args.batch] for i in range(0, len(nodes), args.batch)]
+    sem = asyncio.Semaphore(args.speed_conc)
+    async with httpx.AsyncClient(timeout=5) as rc:
+        for bi, batch in enumerate(batches, 1):
+            if time.time() > args.deadline:
+                break
+            tags = ["s%05d" % i for i in range(len(batch))]
+            base = next(IN_BASE)
+            t0 = time.time()
+            log("[speed] batch %d/%d (%d nodes)" % (bi, len(batches), len(batch)))
+            with tempfile.TemporaryDirectory(dir=work) as td:
+                wd = Path(td)
+                eng = Engine(exe, wd, next(PORTS))
+                try:
+                    started = await eng.start_cfg(speed_config(batch, tags, eng.port, base), rc)
+                except Exception:
+                    started = False
+                if not started:
+                    eng.stop()
+                    log("[speed] engine would not start - skipping bandwidth test")
+                    return out
+                done = 0
+
+                async def one(i):
+                    nonlocal done
+                    async with sem:
+                        t = time.monotonic()
+                        try:
+                            async with httpx.AsyncClient(
+                                    proxy="http://127.0.0.1:%d" % (base + i),
+                                    timeout=args.speed_timeout / 1000 + 2,
+                                    follow_redirects=True) as c:
+                                r = await c.get(SPEED_URL)
+                                dt = time.monotonic() - t
+                                nb = len(r.content)
+                                if r.status_code == 200 and nb > 2000 and dt > 0.001:
+                                    out[batch[i]["uid"]] = (nb / 1024.0) / dt
+                        except Exception:
+                            pass
+                        done += 1
+                        if done % 40 == 0:
+                            log("      speed %d/%d" % (done, len(batch)))
+
+                try:
+                    await asyncio.gather(*(one(i) for i in range(len(batch))))
+                finally:
+                    eng.stop()
+            log("[speed] batch %d/%d ok=%d %.1fs"
+                % (bi, len(batches), len(out), time.time() - t0))
+    return out
+
+
+# ------------------------------------------------------------------ ranking
+def build_records(pool, screen, final, speed, args):
+    recs = []
+    need = max(2, (args.rounds_final + 1) // 2)
+    for n in pool:
+        uid = n["uid"]
+        fs = final.get(uid) or []
+        ss = screen.get(uid) or []
+        samples = fs or ss
+        if not samples:
+            continue
+        lat = statistics.median(samples)
+        jit = statistics.pstdev(samples) if len(samples) > 1 else 0.0
+        kbs = speed.get(uid)
+        stable = len(fs) >= need
+        fast = kbs is not None and kbs >= args.min_kbs
+        tier = 0 if (fast and stable) else (1 if (fast or stable) else 2)
+        recs.append({"n": n, "lat": lat, "jit": jit, "kbs": kbs,
+                     "tier": tier, "sort": (tier, lat + jit)})
+    recs.sort(key=lambda r: r["sort"])
+    return recs
+
+
+def select(recs, top, ws_quota, split):
+    if not split:
+        return recs[:top]
+    ws = [r for r in recs if r["n"]["net"] == "ws"]
+    hu = [r for r in recs if r["n"]["net"] == "httpupgrade"]
+    chosen = ws[:ws_quota] + hu[:max(0, top - ws_quota)]
+    if len(chosen) < top:
+        used = {id(r) for r in chosen}
+        rest = [r for r in recs if id(r) not in used]
+        chosen += rest[:top - len(chosen)]
+    chosen.sort(key=lambda r: r["sort"])
+    return chosen[:top]
+
+
+def export(proto, recs, args):
     od = Path(args.out_dir)
     od.mkdir(parents=True, exist_ok=True)
-    top, used = [], set()
-    for n, ms in ranked:
-        hp = (n["host"].lower(), n["port"])
-        if hp in used:
-            continue
-        used.add(hp)
-        top.append((n, ms))
-        if len(top) >= args.top:
-            break
+    split = proto in SPLIT_PROTOS
+    chosen = select(recs, args.top, args.ws_quota, split)
 
-    lines = []
-    for n, ms in top:
+    lines, report = [], []
+    for i, r in enumerate(chosen, 1):
+        n = r["n"]
+        tier = TIERS[r["tier"]]
         if args.annotate:
-            base = n["link"].split("#")[0]
             tag = (n["remark"] or n["host"]).strip()
-            lines.append(base + "#" + quote("%s | %dms" % (tag, ms)))
+            lines.append(n["link"].split("#")[0] + "#" +
+                         quote("%s | %dms | %s" % (tag, r["lat"], tier)))
         else:
             lines.append(n["link"])
+        report.append({"rank": i, "protocol": proto, "tier": tier,
+                       "transport": n["net"], "host_header": effective_host(n),
+                       "server": n["host"], "port": n["port"],
+                       "latency_ms": round(r["lat"], 1),
+                       "jitter_ms": round(r["jit"], 1),
+                       "download_kbs": round(r["kbs"], 1) if r["kbs"] else None,
+                       "remark": n["remark"], "link": n["link"]})
 
     txt = od / ("%s_top%d.txt" % (proto, args.top))
     txt.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
     (od / ("%s_top%d_b64.txt" % (proto, args.top))).write_text(
         base64.b64encode("\n".join(lines).encode()).decode(), encoding="utf-8")
-    (od / ("%s_report.json" % proto)).write_text(json.dumps(
-        [{"rank": i + 1, "protocol": proto, "transport": n["net"],
-          "host": n["host"], "port": n["port"], "latency_ms": round(ms, 1),
-          "remark": n["remark"], "link": n["link"]}
-         for i, (n, ms) in enumerate(top)], indent=2, ensure_ascii=False), encoding="utf-8")
+    (od / ("%s_report.json" % proto)).write_text(
+        json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    rule = " (ws / httpupgrade only)" if proto in ("vless", "trojan") else ""
-    log("\n=== %s - top %d%s" % (proto.upper(), len(top), rule))
-    for i, (n, ms) in enumerate(top, 1):
-        log("  %2d. %7.1f ms  %-11s %s:%d" % (i, ms, n["net"], n["host"], n["port"]))
+    nws = sum(1 for r in chosen if r["n"]["net"] == "ws")
+    nhu = sum(1 for r in chosen if r["n"]["net"] == "httpupgrade")
+    ngold = sum(1 for r in chosen if r["tier"] == 0)
+    rule = " (ws / httpupgrade only, Host required)" if split else ""
+    log("\n=== %s : %d configs%s" % (proto.upper(), len(chosen), rule))
+    log("    ws=%d  httpupgrade=%d  GOLD=%d" % (nws, nhu, ngold))
+    for r in chosen[:10]:
+        n = r["n"]
+        log("  %7.1f ms  %-11s %-6s %s" %
+            (r["lat"], n["net"], TIERS[r["tier"]], effective_host(n)))
+    if len(chosen) > 10:
+        log("  ... %d more in the file" % (len(chosen) - 10))
     log("  -> %s" % txt)
-    if len(top) < args.top:
-        log("  NOTE: only %d live nodes matched." % len(top))
-    return len(top), (top[0][1] if top else None)
+    if len(chosen) < args.top:
+        log("  NOTE: only %d qualified." % len(chosen))
+    return {"written": len(chosen), "ws": nws, "hu": nhu, "gold": ngold,
+            "best": chosen[0]["lat"] if chosen else None}
 
 
 def write_summary(rows, out_dir):
     md = ["# Proxy Hunter results", "",
-          "| Protocol | Tested | Live | Written | Fastest |",
-          "|---|---|---|---|---|"]
-    for p, tested, live, written, best in rows:
-        md.append("| %s | %d | %d | %d | %s |"
-                  % (p, tested, live, written, ("%.0f ms" % best) if best else "-"))
-    md += ["", "VLESS and Trojan contain **only WebSocket / HTTPUpgrade** servers.",
+          "| Protocol | Servers | Tested | Live | WS | HTTPUpgrade | Gold | Written | Fastest |",
+          "|---|---|---|---|---|---|---|---|---|"]
+    for r in rows:
+        md.append("| %s | %d | %d | %d | %d | %d | %d | %d | %s |" % (
+            r["proto"], r["servers"], r["tested"], r["live"], r["ws"], r["hu"],
+            r["gold"], r["written"], ("%.0f ms" % r["best"]) if r["best"] else "-"))
+    md += ["",
+           "**GOLD** = low latency + stable across 3 rounds + real 256 KB download.",
+           "VLESS / Trojan are **ws or httpupgrade only**, and every ws/httpupgrade",
+           "config has a **real non-empty Host header** (blank/IP-only rejected).",
            "Latency measured from the GitHub runner (usually USA)."]
     text = "\n".join(md) + "\n"
     try:
@@ -860,20 +1101,25 @@ def write_summary(rows, out_dir):
 
 # ------------------------------------------------------------------ main
 async def main_async(args):
+    args.deadline = time.time() + args.max_minutes * 60
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=256))
     od = Path(args.out_dir)
     od.mkdir(parents=True, exist_ok=True)
     wanted = PROTOS if args.protocol.strip().lower() == "all" else [
         x.strip().lower() for x in args.protocol.split(",") if x.strip()]
     wanted = [p for p in wanted if p in PROTOS] or PROTOS
 
+    def blank(p):
+        (od / ("%s_top%d.txt" % (p, args.top))).write_text("")
+        return {"proto": p, "servers": 0, "tested": 0, "live": 0, "ws": 0,
+                "hu": 0, "gold": 0, "written": 0, "best": None}
+
     try:
         exe = ensure_singbox(Path(args.bindir))
         log("[engine] sing-box ready: %s" % exe)
     except Exception as e:
         log("!! Could not get sing-box: %s" % e)
-        for p in wanted:
-            (od / ("%s_top%d.txt" % (p, args.top))).write_text("")
-        write_summary([(p, 0, 0, 0, None) for p in wanted], od)
+        write_summary([blank(p) for p in wanted], od)
         return
 
     try:
@@ -882,9 +1128,7 @@ async def main_async(args):
         texts = []
     if not texts:
         log("!! No sources could be downloaded.")
-        for p in wanted:
-            (od / ("%s_top%d.txt" % (p, args.top))).write_text("")
-        write_summary([(p, 0, 0, 0, None) for p in wanted], od)
+        write_summary([blank(p) for p in wanted], od)
         return
 
     seen_links, seen_keys, nodes = set(), set(), []
@@ -905,20 +1149,33 @@ async def main_async(args):
 
     log("\n[parse] %d links -> %d unique usable nodes" % (len(seen_links), len(nodes)))
     for p in PROTOS:
-        c = sum(1 for n in nodes if n["proto"] == p)
-        g = sum(1 for n in nodes if n["proto"] == p and gate(n))
-        log("        %-11s %6d   after rule: %6d" % (p, c, g))
+        a = sum(1 for n in nodes if n["proto"] == p)
+        b = sum(1 for n in nodes if n["proto"] == p and gate(n))
+        c = sum(1 for n in nodes if n["proto"] == p and gate(n) and host_ok(n))
+        log("        %-11s %6d  transport-ok %6d  host-ok %6d" % (p, a, b, c))
 
     rows = []
     for proto in wanted:
         try:
-            pool = [n for n in nodes if n["proto"] == proto and gate(n)]
-            if not pool:
-                log("\n[%s] nothing to test" % proto)
+            if time.time() > args.deadline:
+                log("[%s] skipped - time budget used up" % proto)
                 export(proto, [], args)
-                rows.append((proto, 0, 0, 0, None))
+                rows.append(blank(proto))
                 continue
-            log("\n[%s] preflight %d nodes..." % (proto, len(pool)))
+
+            split = proto in SPLIT_PROTOS
+            raw = [n for n in nodes if n["proto"] == proto]
+            ok_t = [n for n in raw if gate(n)]
+            ok_h = [n for n in ok_t if host_ok(n)]
+            pool = unique_servers(ok_h)
+            log("\n[%s] %d -> %d transport -> %d valid Host -> %d unique servers"
+                % (proto, len(raw), len(ok_t), len(ok_h), len(pool)))
+            if not pool:
+                info = export(proto, [], args)
+                rows.append({"proto": proto, "servers": 0, "tested": 0, "live": 0, **info})
+                continue
+
+            log("[%s] preflight..." % proto)
             if args.no_preflight:
                 for n in pool:
                     n["ip"] = n["host"]
@@ -926,39 +1183,43 @@ async def main_async(args):
             else:
                 live = await preflight(pool, args.preflight_timeout, args.preflight_conc)
             log("[%s] reachable: %d" % (proto, len(live)))
-            if args.max_test and len(live) > args.max_test:
-                live = live[:args.max_test]
-            if not live:
-                export(proto, [], args)
-                rows.append((proto, len(pool), 0, 0, None))
+
+            budget = args.max_test if split else args.max_test_other
+            cand = allocate_quota(live, budget, split)
+            log("[%s] deep-testing %d (ws=%d httpupgrade=%d)" % (
+                proto, len(cand),
+                sum(1 for n in cand if n["net"] == "ws"),
+                sum(1 for n in cand if n["net"] == "httpupgrade")))
+            if not cand:
+                info = export(proto, [], args)
+                rows.append({"proto": proto, "servers": len(pool), "tested": 0,
+                             "live": 0, **info})
                 continue
 
-            samples = await measure_all(exe, live, args)
-            scored = [(n, statistics.median(samples[n["uid"]]))
-                      for n in live if n["uid"] in samples
-                      and len(samples[n["uid"]]) >= args.min_success]
+            screen = await measure_all(exe, cand, args, rounds=args.rounds, label="test")
+            scored = [(n, statistics.median(screen[n["uid"]]))
+                      for n in cand if n["uid"] in screen
+                      and len(screen[n["uid"]]) >= args.min_success]
             scored.sort(key=lambda x: x[1])
-            log("[%s] %d passed the real end-to-end test" % (proto, len(scored)))
+            log("[%s] %d passed screening" % (proto, len(scored)))
 
-            finalists = scored[:max(args.top * 3, args.top)]
-            if finalists and args.rounds_final > 0:
-                saved = args.rounds
-                args.rounds = args.rounds_final
+            fin_nodes = allocate_quota([n for n, _ in scored], args.finalists, split)
+            final, speed = {}, {}
+            if fin_nodes and time.time() < args.deadline:
+                final = await measure_all(exe, fin_nodes, args,
+                                          rounds=args.rounds_final, label="verify")
+            if (fin_nodes and not args.no_speed_test
+                    and args.deadline - time.time() > 90):
                 try:
-                    again = await measure_all(exe, [n for n, _ in finalists], args)
-                finally:
-                    args.rounds = saved
-                rescored = []
-                for n, _old in finalists:
-                    s = again.get(n["uid"])
-                    if s and len(s) >= max(1, args.rounds_final - 1):
-                        rescored.append((n, statistics.median(s)))
-                rescored.sort(key=lambda x: x[1])
-                if rescored:
-                    scored = rescored + scored[len(finalists):]
+                    speed = await speed_measure(exe, fin_nodes, args)
+                    log("[%s] bandwidth verified on %d nodes" % (proto, len(speed)))
+                except Exception:
+                    log("[%s] bandwidth test skipped" % proto)
 
-            written, best = export(proto, scored, args)
-            rows.append((proto, len(live), len(scored), written, best))
+            recs = build_records([n for n, _ in scored], screen, final, speed, args)
+            info = export(proto, recs, args)
+            rows.append({"proto": proto, "servers": len(pool), "tested": len(cand),
+                         "live": len(scored), **info})
         except Exception:
             log("[%s] skipped due to an internal problem:" % proto)
             traceback.print_exc()
@@ -966,7 +1227,7 @@ async def main_async(args):
                 export(proto, [], args)
             except Exception:
                 pass
-            rows.append((proto, 0, 0, 0, None))
+            rows.append(blank(proto))
 
     write_summary(rows, od)
     log("\nDone. Files are in: %s" % od)
@@ -975,19 +1236,27 @@ async def main_async(args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--protocol", default="all")
-    ap.add_argument("--top", type=int, default=10)
+    ap.add_argument("--top", type=int, default=100)
+    ap.add_argument("--ws-quota", type=int, default=50)
     ap.add_argument("--out-dir", default="out")
-    ap.add_argument("--rounds", type=int, default=2)
+    ap.add_argument("--rounds", type=int, default=1)
     ap.add_argument("--rounds-final", type=int, default=3)
+    ap.add_argument("--finalists", type=int, default=240)
     ap.add_argument("--min-success", type=int, default=1)
-    ap.add_argument("--timeout", type=int, default=4000)
-    ap.add_argument("--concurrency", type=int, default=32)
-    ap.add_argument("--batch", type=int, default=150)
-    ap.add_argument("--max-test", type=int, default=900)
-    ap.add_argument("--preflight-timeout", type=float, default=1.5)
-    ap.add_argument("--preflight-conc", type=int, default=400)
+    ap.add_argument("--timeout", type=int, default=2500)
+    ap.add_argument("--concurrency", type=int, default=64)
+    ap.add_argument("--batch", type=int, default=80)
+    ap.add_argument("--max-test", type=int, default=1200)
+    ap.add_argument("--max-test-other", type=int, default=600)
+    ap.add_argument("--speed-timeout", type=int, default=8000)
+    ap.add_argument("--speed-conc", type=int, default=24)
+    ap.add_argument("--min-kbs", type=float, default=60.0)
+    ap.add_argument("--no-speed-test", action="store_true")
+    ap.add_argument("--max-minutes", type=int, default=42)
+    ap.add_argument("--preflight-timeout", type=float, default=1.2)
+    ap.add_argument("--preflight-conc", type=int, default=600)
     ap.add_argument("--no-preflight", action="store_true")
-    ap.add_argument("--discover", type=int, default=0)
+    ap.add_argument("--discover", type=int, default=10)
     ap.add_argument("--annotate", action="store_true")
     ap.add_argument("--workdir", default=".nh")
     ap.add_argument("--bindir", default="bin")
