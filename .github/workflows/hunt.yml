@@ -28,7 +28,7 @@ concurrency:
 jobs:
   hunt:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 55
 
     steps:
       - name: Get repo files
@@ -65,15 +65,23 @@ jobs:
         run: |
           python nodehunt.py \
             --protocol "$PROTOCOL" \
-            --top 10 \
+            --top 100 \
+            --ws-quota 50 \
             --out-dir out \
-            --batch 150 \
-            --concurrency 32 \
-            --timeout 4000 \
-            --rounds 2 \
+            --batch 80 \
+            --concurrency 64 \
+            --timeout 2500 \
+            --rounds 1 \
             --rounds-final 3 \
-            --max-test 900 \
-            --discover 15
+            --finalists 240 \
+            --max-test 1200 \
+            --max-test-other 600 \
+            --speed-timeout 8000 \
+            --speed-conc 24 \
+            --min-kbs 60 \
+            --max-minutes 42 \
+            --discover 10 \
+            --annotate
 
       - name: Save results into the repo
         if: always()
