@@ -1,0 +1,39 @@
+# One source per line. Lines starting with # are ignored.
+# Format A:  owner/repo            (whole repo gets scanned)
+# Format B:  owner/repo:path.txt   (one specific file)
+# Format C:  https://any-subscription-url
+# Add your own any time - no coding needed.
+
+barry-far/V2ray-Configs:Sub1.txt
+barry-far/V2ray-Configs:Sub2.txt
+barry-far/V2ray-Configs:Sub3.txt
+barry-far/V2ray-Configs:Sub4.txt
+Epodonios/v2ray-configs:All_Configs_Sub.txt
+mahdibland/V2RayAggregator:Eternity.txt
+mahdibland/V2RayAggregator:sub/sub_merge.txt
+soroushmirzaei/telegram-configs-collector:protocols/vless
+soroushmirzaei/telegram-configs-collector:protocols/vmess
+soroushmirzaei/telegram-configs-collector:protocols/trojan
+soroushmirzaei/telegram-configs-collector:protocols/shadowsocks
+soroushmirzaei/telegram-configs-collector:protocols/hysteria
+yebekhe/TelegramV2rayCollector:sub/mix/base64
+lagzian/TelegramV2rayCollector:sub/mix/base64
+MrMohebi/xray-proxy-grabber-telegram:collected-proxies/row-url/all.txt
+peasoft/NoMoreWalls:list.txt
+SurgePro/NoMoreWalls:list.txt
+ermaozi/get_subscribe:subscribe/v2ray.txt
+Pawdroid/Free-servers:sub
+mfuu/v2ray:v2ray
+aiboboxx/v2rayfree:README.md
+freefq/free:README.md
+vxiaov/free_proxies:v2ray_free.txt
+anaer/Sub:sub
+roosterkid/openproxylist:V2RAY_RAW.txt
+roosterkid/openproxylist:V2RAY_BASE64.txt
+ripaojiedian/freenode:sub
+Leon406/SubCrawler
+V2RayRoot/V2Root
+w1770946466/Auto_proxy
+free-nodes/v2rayfree
+Flik6/getNode
+EveryDayCloud/EveryDay-VPN
