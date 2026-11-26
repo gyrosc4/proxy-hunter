@@ -2,7 +2,7 @@
 
 | Protocol | Servers | Tested | Live | WS | HTTPUpgrade | Gold | Written | Fastest |
 |---|---|---|---|---|---|---|---|---|
-| hysteria2 | 177 | 177 | 53 | 0 | 0 | 48 | 53 | 95 ms |
+| trojan | 35 | 31 | 2 | 2 | 0 | 1 | 2 | 431 ms |
 
 **GOLD** = low latency + stable across 3 rounds + real 256 KB download.
 VLESS / Trojan are **ws or httpupgrade only**, and every ws/httpupgrade

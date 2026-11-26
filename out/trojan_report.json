@@ -1,0 +1,30 @@
+[
+  {
+    "rank": 1,
+    "protocol": "trojan",
+    "tier": "GOLD",
+    "transport": "ws",
+    "host_header": "bitter-math-4364.vpnetwork3567.workers.dev",
+    "server": "bitter-math-4364.vpnetwork3567.workers.dev",
+    "port": 443,
+    "latency_ms": 431.0,
+    "jitter_ms": 22.6,
+    "download_kbs": 159.4,
+    "remark": "🇺🇦 Ukraine, Vinnytsia | [BL]",
+    "link": "trojan://963A4918-A630-29DA-A873-093CDF8AD784@bitter-math-4364.vpnetwork3567.workers.dev:443?type=ws&security=tls&fp=chrome&host=bitter-math-4364.vpnetwork3567.workers.dev&alpn=http/1.1#%F0%9F%87%BA%F0%9F%87%A6%20Ukraine%2C%20Vinnytsia%20%7C%20%5BBL%5D"
+  },
+  {
+    "rank": 2,
+    "protocol": "trojan",
+    "tier": "BRONZE",
+    "transport": "ws",
+    "host_header": "lingering-fire-1fe9.vpnetwork3567.workers.dev",
+    "server": "lingering-fire-1fe9.vpnetwork3567.workers.dev",
+    "port": 443,
+    "latency_ms": 479.0,
+    "jitter_ms": 0.0,
+    "download_kbs": null,
+    "remark": "🇸🇬 Singapore, Singapore (Queenstown Estate) | [BL]",
+    "link": "trojan://963A4918-A630-29DA-A873-093CDF8AD784@lingering-fire-1fe9.vpnetwork3567.workers.dev:443?type=ws&security=tls&fp=chrome&host=lingering-fire-1fe9.vpnetwork3567.workers.dev&alpn=http/1.1#%F0%9F%87%B8%F0%9F%87%AC%20Singapore%2C%20Singapore%20%28Queenstown%20Estate%29%20%7C%20%5BBL%5D"
+  }
+]
