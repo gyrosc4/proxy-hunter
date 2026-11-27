@@ -1,8 +1,6 @@
-# One source per line. Lines starting with # are ignored.
-# Format A:  owner/repo            (whole repo gets scanned)
-# Format B:  owner/repo:path.txt   (one specific file)
-# Format C:  https://any-subscription-url
-# Add your own any time - no coding needed.
+# Seed list. Discovery finds hundreds more automatically.
+# Dead entries are skipped silently - nothing breaks.
+# Format: owner/repo  |  owner/repo:path  |  https://url
 
 barry-far/V2ray-Configs:Sub1.txt
 barry-far/V2ray-Configs:Sub2.txt
@@ -16,6 +14,7 @@ soroushmirzaei/telegram-configs-collector:protocols/vmess
 soroushmirzaei/telegram-configs-collector:protocols/trojan
 soroushmirzaei/telegram-configs-collector:protocols/shadowsocks
 soroushmirzaei/telegram-configs-collector:protocols/hysteria
+soroushmirzaei/telegram-configs-collector:protocols/wireguard
 yebekhe/TelegramV2rayCollector:sub/mix/base64
 lagzian/TelegramV2rayCollector:sub/mix/base64
 MrMohebi/xray-proxy-grabber-telegram:collected-proxies/row-url/all.txt
@@ -29,11 +28,32 @@ freefq/free:README.md
 vxiaov/free_proxies:v2ray_free.txt
 anaer/Sub:sub
 roosterkid/openproxylist:V2RAY_RAW.txt
-roosterkid/openproxylist:V2RAY_BASE64.txt
 ripaojiedian/freenode:sub
+Barabama/FreeNodes
+NiREvil/vless
 Leon406/SubCrawler
 V2RayRoot/V2Root
 w1770946466/Auto_proxy
 free-nodes/v2rayfree
 Flik6/getNode
 EveryDayCloud/EveryDay-VPN
+mheidari98/.proxy
+surfboardv2ray/TGParse
+surfboardv2ray/Proxy-sorter
+miladtahanian/V2RayCFGDumper
+mohamadfg-dev/telegram-v2ray-configs-collector
+MhdiTaheri/V2rayCollector
+coldwater-10/V2ray-Configs
+youfoundamin/V2rayCollector
+AzadNetCH/Clash
+AzadNetCH/V2Ray
+openRunner/clash-freenode
+changfengoss/pub
+ssrsub/ssr
+iwxf/free-v2ray
+Jsnzkpg/Jsnzkpg
+xiaoji235/airport-free
+go4sharing/sub
+dongchengjie/airport
+lanfxx/v2ray
+NiCkNam7/Free-v2ray-Collector
