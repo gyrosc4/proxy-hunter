@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       protocol:
-        description: "Which protocol do you want?"
+        description: "Protocol"
         required: true
         default: "all"
         type: choice
@@ -15,6 +15,28 @@ on:
           - trojan
           - ss
           - hysteria2
+          - wireguard
+      country:
+        description: "Country flag - server IP must be in this country"
+        required: true
+        default: "🌍 Any"
+        type: choice
+        options:
+          - "🌍 Any"
+          - "🇺🇸 US"
+          - "🇩🇪 DE"
+          - "🇳🇱 NL"
+          - "🇬🇧 GB"
+          - "🇫🇷 FR"
+          - "🇯🇵 JP"
+          - "🇸🇬 SG"
+          - "🇨🇦 CA"
+          - "🇫🇮 FI"
+      country_code:
+        description: "OR type any code(s): SE, TR, PL, AE, IR, IN ... (overrides the flag above)"
+        required: false
+        default: ""
+        type: string
   schedule:
     - cron: "0 */6 * * *"
 
@@ -28,7 +50,7 @@ concurrency:
 jobs:
   hunt:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 58
 
     steps:
       - name: Get repo files
@@ -58,29 +80,39 @@ jobs:
           sudo install -m 755 "$BIN" /usr/local/bin/sing-box
           sing-box version
 
-      - name: Hunt for the fastest configs
+      - name: Hunt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PROTOCOL: ${{ github.event.inputs.protocol || 'all' }}
+          COUNTRY: ${{ github.event.inputs.country_code || github.event.inputs.country || 'any' }}
         run: |
           python nodehunt.py \
             --protocol "$PROTOCOL" \
+            --country "$COUNTRY" \
             --top 100 \
             --ws-quota 50 \
+            --hu-quota-trojan 70 \
             --out-dir out \
-            --batch 80 \
-            --concurrency 64 \
+            --max-repos 250 \
+            --files-per-repo 6 \
+            --harvest-mb 220 \
+            --harvest-minutes 6 \
+            --max-age-days 60 \
+            --discover 400 \
+            --batch 100 \
+            --concurrency 80 \
             --timeout 2500 \
             --rounds 1 \
             --rounds-final 3 \
-            --finalists 240 \
-            --max-test 1200 \
-            --max-test-other 600 \
+            --finalists 280 \
+            --max-test 2000 \
+            --max-test-other 900 \
             --speed-timeout 8000 \
             --speed-conc 24 \
             --min-kbs 60 \
-            --max-minutes 42 \
-            --discover 10 \
+            --wg-batch 25 \
+            --wg-rounds 2 \
+            --max-minutes 46 \
             --annotate
 
       - name: Save results into the repo
@@ -90,9 +122,9 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
           git add -f out
           git commit -m "Update configs $(date -u '+%Y-%m-%d %H:%M UTC')" || echo "No changes"
-          git push || echo "Push skipped - download the artifact instead"
+          git push || echo "Push skipped - use the artifact download"
 
-      - name: Upload results as a download
+      - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
