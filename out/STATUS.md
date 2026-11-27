@@ -4,7 +4,7 @@ Country filter: **US**
 
 | Protocol | Servers | In country | Tested | Live | WS | HU | Gold | Written | Fastest |
 |---|---|---|---|---|---|---|---|---|---|
-| wireguard | 514 | 375 | 375 | 42 | 0 | 0 | 41 | 42 | 54 ms |
+| ss | 2800 | 125 | 125 | 73 | 0 | 0 | 71 | 73 | 30 ms |
 
 **GOLD** = low latency + stable + real 256 KB download.
 Trojan lists HTTPUpgrade first. VLESS/Trojan are ws/httpupgrade only,
