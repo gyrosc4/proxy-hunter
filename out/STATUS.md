@@ -1,10 +1,10 @@
 # Proxy Hunter results
 
-Country filter: **US**
+Country filter: **SG**
 
 | Protocol | Servers | In country | Tested | Live | WS | HU | Gold | Written | Fastest |
 |---|---|---|---|---|---|---|---|---|---|
-| ss | 2800 | 125 | 125 | 73 | 0 | 0 | 71 | 73 | 30 ms |
+| trojan | 218 | 7 | 7 | 0 | 0 | 0 | 0 | 0 | - |
 
 **GOLD** = low latency + stable + real 256 KB download.
 Trojan lists HTTPUpgrade first. VLESS/Trojan are ws/httpupgrade only,
