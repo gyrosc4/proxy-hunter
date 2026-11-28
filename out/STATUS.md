@@ -4,12 +4,12 @@ Country filter: **Any**
 
 | Protocol | Servers | In country | Tested | Live | WS | HU | Gold | Written | Fastest |
 |---|---|---|---|---|---|---|---|---|---|
-| vless | 5044 | 3340 | 2000 | 205 | 100 | 0 | 88 | 100 | 31 ms |
-| vmess | 2514 | 725 | 725 | 103 | 9 | 0 | 96 | 100 | 33 ms |
-| trojan | 223 | 173 | 173 | 13 | 13 | 0 | 2 | 13 | 74 ms |
-| ss | 2797 | 515 | 515 | 341 | 0 | 0 | 100 | 100 | 32 ms |
-| hysteria2 | 435 | 383 | 383 | 68 | 0 | 0 | 63 | 68 | 35 ms |
-| wireguard | 436 | 435 | 435 | 65 | 0 | 0 | 62 | 65 | 59 ms |
+| vless | 5083 | 3347 | 2000 | 47 | 47 | 0 | 22 | 47 | 71 ms |
+| vmess | 2505 | 746 | 746 | 90 | 6 | 0 | 88 | 90 | 23 ms |
+| trojan | 232 | 182 | 182 | 1 | 1 | 0 | 0 | 1 | 47 ms |
+| ss | 2816 | 514 | 514 | 299 | 0 | 0 | 100 | 100 | 31 ms |
+| hysteria2 | 413 | 359 | 359 | 42 | 0 | 0 | 35 | 42 | 26 ms |
+| wireguard | 437 | 436 | 436 | 72 | 0 | 0 | 72 | 72 | 43 ms |
 
 **GOLD** = low latency + stable + real 256 KB download.
 Trojan lists HTTPUpgrade first. VLESS/Trojan are ws/httpupgrade only,
